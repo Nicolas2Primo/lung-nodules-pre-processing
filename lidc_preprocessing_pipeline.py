@@ -7,9 +7,9 @@ para que qualquer modelo (2_D, 2.5_D, 3_D) possa ser preparado em passos posteri
 Estrutura de saída
 ==================
 processed_lidc_general/
-├─ volumes/           patientID.npz   «volume» int16 HU (Z,Y,X)
-├─ masks/             patientID_mask.npz   «nodule_mask» uint8 (Z,Y,X)
-├─ lung_masks/        patientID_lung.npz   «lung_mask» uint8 (Z,Y,X)
+├─ volumes/           patientID_scanID.npz         «volume» int16 HU (Z,Y,X)
+├─ masks/             patientID_scanID_mask.npz    «nodule_mask» uint8 (Z,Y,X)
+├─ lung_masks/        patientID_scanID_lung.npz    «lung_mask» uint8 (Z,Y,X)
 └─ metadata.parquet   tabela por *scan* (id, dims, n_nódulos, split)
 
 Características principais
@@ -63,12 +63,19 @@ def resample(vol: np.ndarray, spacing: np.ndarray, tgt: Tuple[float, float, floa
     return ndi.zoom(vol, zoom, order=1)
 
 
+def resample_mask(mask: np.ndarray, spacing: np.ndarray, tgt: Tuple[float, float, float]) -> np.ndarray:
+    """Resample binary mask using nearest-neighbour interpolation."""
+    zoom = spacing / np.array(tgt)
+    return ndi.zoom(mask.astype(float), zoom, order=0)
+
+
 def build_consensus(scan: pl.Scan, shape: Tuple[int, int, int], thr: float) -> np.ndarray:
+    """Return majority vote mask in the original scan resolution."""
     stacks = []
     for ann in scan.cluster_annotations():
         m, (z0, y0, x0) = ann.boolean_mask(loc=True)
         tmp = np.zeros(shape, np.uint8)
-        tmp[z0:z0+m.shape[0], y0:y0+m.shape[1], x0:x0+m.shape[2]] = m
+        tmp[z0:z0 + m.shape[0], y0:y0 + m.shape[1], x0:x0 + m.shape[2]] = m
         stacks.append(tmp)
     if not stacks:
         return np.zeros(shape, np.uint8)
@@ -98,17 +105,20 @@ def main(cfg: Config):
     rows: List[dict] = []
     for scan in pl.query(pl.Scan):
         try:
-            vol_hu, spacing, _ = scan.to_volume()
-            vol_hu = vol_hu.astype(np.int16)
-            vol_hu = resample(vol_hu, spacing, cfg.voxel_spacing)
+            vol_orig, spacing, _ = scan.to_volume()
+            vol_orig = vol_orig.astype(np.int16)
 
-            nodule_mask = build_consensus(scan, vol_hu.shape, cfg.consensus_thr)
+            consensus = build_consensus(scan, vol_orig.shape, cfg.consensus_thr)
+
+            vol_hu = resample(vol_orig, spacing, cfg.voxel_spacing)
+            nodule_mask = resample_mask(consensus, spacing, cfg.voxel_spacing).astype(np.uint8)
             lung = lung_mask(vol_hu)
 
             # Salvar arquivos -------------------------------------------------
-            vol_path = cfg.out_dir / "volumes" / f"{scan.patient_id}.npz"
-            mask_path = cfg.out_dir / "masks" / f"{scan.patient_id}_mask.npz"
-            lung_path = cfg.out_dir / "lung_masks" / f"{scan.patient_id}_lung.npz"
+            base = f"{scan.patient_id}_{scan.id}"
+            vol_path = cfg.out_dir / "volumes" / f"{base}.npz"
+            mask_path = cfg.out_dir / "masks" / f"{base}_mask.npz"
+            lung_path = cfg.out_dir / "lung_masks" / f"{base}_lung.npz"
             np.savez_compressed(vol_path, volume=vol_hu)
             np.savez_compressed(mask_path, nodule_mask=nodule_mask)
             np.savez_compressed(lung_path, lung_mask=lung)
@@ -119,9 +129,9 @@ def main(cfg: Config):
                 "z": vol_hu.shape[0], "y": vol_hu.shape[1], "x": vol_hu.shape[2],
                 "n_nodules": int(nodule_mask.any()),
             })
-            print(f"✔ {scan.patient_id}")
+            print(f"✔ {scan.patient_id}/{scan.id}")
         except Exception as e:
-            print(f"⚠ {scan.patient_id}: {e}")
+            print(f"⚠ {scan.patient_id}/{scan.id}: {e}")
 
     meta = pd.DataFrame(rows)
 
